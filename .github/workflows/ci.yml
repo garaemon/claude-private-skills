@@ -103,6 +103,16 @@ jobs:
       - name: Smoke test image
         run: bash .claude/skills/pdf2zh/tests/smoke.sh
 
+  check-updates-image:
+    name: Build check-updates image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t check-updates:local .claude/skills/check-updates
+      - name: Smoke test image
+        run: bash .claude/skills/check-updates/tests/smoke.sh
+
   pip-audit:
     name: pip audit (pdf2zh)
     runs-on: ubuntu-latest
