@@ -1,0 +1,266 @@
+---
+name: tldr-digest
+model: haiku
+description: |
+  Summarize the real articles in unread TLDR newsletter emails in
+  Japanese. TLDR newsletters (TLDR AI, TLDR Web Dev, the main TLDR,
+  etc.) are sent from `tldrnewsletter.com` and are usually filed under
+  the user's `ML/TLDR` Gmail label. For each genuine article — not a
+  `(SPONSOR)` slot, a nav link, or a job posting — resolve its source
+  URL from the email's footnote link list, fetch the page, and produce
+  a short Japanese outline summary. Gmail is read through the `gws`
+  (Google Workspace) CLI running directly on the host.
+  Trigger when the user asks to read or summarize their TLDR / ML
+  newsletters, with phrases like "TLDRまとめて", "TLDRの要約",
+  "今日のTLDR", "ML/TLDR まとめ", "未読のTLDR読んで", "tldr-digest".
+allowed-tools: Bash(gws gmail:*), Bash(jq:*), Bash(base64:*), Bash(tr:*), Bash(date:*), Bash(mkdir:*), WebFetch
+---
+
+# TLDR Digest Skill
+
+Turn the user's oldest unread TLDR newsletter email into a concise
+Japanese digest. The skill always processes exactly one newsletter — the
+single oldest unread message — keeping only the genuine articles
+(dropping sponsor slots, navigation, and job ads), resolves each
+article's real source URL from the footnote link list at the bottom of
+the email, fetches that page, and summarizes it with a fixed prompt.
+
+The skill reads Gmail through the `gws` CLI. By an explicit decision of
+the repository owner this skill runs `gws` directly on the host rather
+than inside Docker — see [Security note](#security-note).
+
+## Prerequisites
+
+- `gws` (Google Workspace CLI) is installed and already authenticated
+  (`gws gmail users messages list ...` succeeds without prompting). If a
+  call fails with an auth error, stop and tell the user to run
+  `gws auth login` themselves.
+- Network access for `WebFetch` to load article pages.
+- `jq` and `base64` are available (both ship with the host).
+- A writable cache directory for the raw message JSON. By default
+  `~/.cache/claude-private-skills/tldr-digest/`. Override with the
+  `TLDR_DIGEST_CACHE_DIR` environment variable.
+
+## Workflow
+
+### Step 1: Find unread TLDR messages
+
+The user's intent is "unread TLDR emails under the `ML/TLDR` label".
+That label is sometimes empty (the Gmail filter does not always apply),
+so query by sender, which is robust:
+
+```bash
+gws gmail users messages list \
+  --params '{"userId":"me","q":"from:tldrnewsletter.com is:unread","maxResults":50}' \
+  --format json
+```
+
+Notes:
+
+- Prefer the label when it is populated. You may first try
+  `"q":"label:ML/TLDR is:unread"`; if it returns zero results, fall
+  back to the sender query above. Do not fail just because the label is
+  empty.
+- The response lists message ids only. `resultSizeEstimate` is an
+  estimate of the total match count, not the page size.
+- If there are no unread messages, stop and reply with a single
+  Japanese line: `未読の TLDR はありません。`
+
+### Step 2: Select the single oldest unread message
+
+This skill always processes exactly **one** newsletter: the oldest unread
+TLDR. Never ask the user how many to process and never batch — regardless
+of how many unread messages exist.
+
+Gmail returns ids newest-first, so the oldest is the last id of the last
+page. Pick it like this:
+
+```bash
+gws gmail users messages list \
+  --params '{"userId":"me","q":"label:ML/TLDR is:unread","maxResults":50}' \
+  --format json | jq -r '.messages[-1].id'
+```
+
+- If the response contains a `nextPageToken`, there are more unread
+  messages than one page holds and the true oldest is on a later page.
+  Follow the token (pass it as `"pageToken"` in `--params`) until no token
+  remains, then take the last id of the final page.
+- Report the total unread count to the user in one Japanese line for
+  context (e.g. `未読 TLDR は N 通。一番古い 1 通を処理します。`), then
+  continue with that single id through Steps 3–6.
+
+### Step 3: Fetch each message and decode its body
+
+For each message id, save the full message and decode the plain-text
+part. Keep the large JSON in a file — do not read it into the response.
+
+```bash
+CACHE_DIR="${TLDR_DIGEST_CACHE_DIR:-$HOME/.cache/claude-private-skills/tldr-digest}"
+mkdir -p "$CACHE_DIR"
+
+gws gmail users messages get \
+  --params '{"userId":"me","id":"<ID>","format":"full"}' \
+  --format json > "$CACHE_DIR/<ID>.json"
+
+# Pull the first text/plain part (recurse handles nested multipart),
+# then convert base64url -> base64 and decode.
+jq -r '[.payload | recurse(.parts[]?) | select(.mimeType=="text/plain") | .body.data] | .[0] // ""' \
+  "$CACHE_DIR/<ID>.json" | tr '_-' '/+' | base64 -d > "$CACHE_DIR/<ID>.txt"
+```
+
+Also read the `Subject`, `From`, and `Date` headers from the same JSON
+for the digest header:
+
+```bash
+jq -r '.payload.headers[] | select(.name=="Subject" or .name=="From" or .name=="Date") | "\(.name): \(.value)"' \
+  "$CACHE_DIR/<ID>.json"
+```
+
+Use `format=full` (not `metadata`): the `gws` metadata mode does not
+pass the `metadataHeaders` array correctly and returns empty headers.
+
+If the plain-text part is missing, fall back to the `text/html` part
+(same decode), then strip tags before parsing. This is rare.
+
+### Step 4: Extract the real articles and resolve their URLs
+
+A TLDR plain-text body has three relevant shapes:
+
+- **Section headers**: short ALL-CAPS lines such as
+  `HEADLINES & LAUNCHES`, `DEEP DIVES & ANALYSIS`,
+  `ENGINEERING & RESEARCH`, `MISCELLANEOUS`, `QUICK LINKS`. Use them to
+  group articles.
+- **Article entries**: a title line of the form
+  `TITLE (X MINUTE READ) [n]` (also `HOUR READ`, `GITHUB REPO`,
+  `MINUTE WATCH`), followed by a 2–4 sentence description. The title
+  often wraps across several lines in the plain-text body; treat
+  everything up to the `[n]` marker as one title.
+- **Footnote links**: at the very bottom, lines of the form `[n] URL`.
+
+Build an `n -> URL` map from the footnote lines, then attach the URL to
+each article via its `[n]` marker.
+
+Keep an entry **only if** it is a genuine article. Drop:
+
+- Anything whose title contains `(SPONSOR)`.
+- Navigation: `Sign Up`, `Advertise`, `View Online`, `TOGETHER WITH`.
+- Job ads and the jobs section (URLs under `jobs.ashbyhq.com`,
+  `advertise.tldr.tech`, etc.).
+- Pure ad links (e.g. an article whose resolved URL is the advertiser's
+  marketing page with `utm_medium=display` / a sponsor campaign).
+
+`QUICK LINKS` entries are usually short real links — include them, but
+still drop sponsors among them.
+
+For each kept article collect: section, title, read-time tag, resolved
+URL, and the email's own 2–4 sentence blurb (used as a fallback).
+
+### Step 5: Fetch each article page and summarize it
+
+For each kept article, `WebFetch` the resolved URL with this exact
+prompt (TLDR redirect links such as `links.tldrnewsletter.com/...`
+resolve to the real page automatically):
+
+```text
+Analyze the current webpage and provide a comprehensive summary in Japanese, organized by a clear logical outline.
+User wants to catch the overview quickly. So that avoid long paragraphs in the summary.
+
+Please structure your response. Detail the key actions or logic presented. Please use bullet points for each section to ensure clarity and conciseness.
+```
+
+If a fetch fails (paywall, blocked, timeout), fall back to the email's
+own blurb for that article and mark it clearly as
+`（本文取得失敗・メール内要約）`. Do not fabricate content.
+
+### Step 6: Render the digest in Japanese
+
+Output a Japanese markdown digest in the chat response. One block per
+newsletter, grouped by section, bullet-point heavy and short:
+
+```markdown
+📰 **TLDR AI（2026-06-12）**
+
+**🚀 HEADLINES & LAUNCHES**
+
+**1. OpenAI が Ona を買収（1 min read）**
+- 要点を箇条書きで
+- もう一点
+🔗 https://source.example/article
+
+**2. ...**
+
+**🧠 DEEP DIVES & ANALYSIS**
+...
+```
+
+Rules:
+
+- The chat response is in Japanese; this SKILL.md and any files written
+  stay in English.
+- Avoid long paragraphs — use bullet points, matching the fetch prompt's
+  intent.
+- Every article must show its real source URL.
+- Skip a section heading if it has no kept articles.
+- Process only the single oldest newsletter and label it with its subject
+  and date.
+
+### Step 7 (optional): Mark as read and archive
+
+Marking mail read and archiving changes the user's Gmail state, so do it
+only when the user asks, and confirm first. "Mark as read" here always
+also archives the message (removes it from the inbox) in the same call —
+remove both the `UNREAD` and `INBOX` labels. When confirmed, per processed
+id:
+
+```bash
+gws gmail users messages modify \
+  --params '{"userId":"me","id":"<ID>"}' \
+  --json '{"removeLabelIds":["UNREAD","INBOX"]}'
+```
+
+Removing `INBOX` archives the message; removing `UNREAD` marks it read.
+Default behaviour is to leave the mail unread and in the inbox.
+
+## Output rules
+
+- Chat response is in Japanese; files (SKILL.md, cached JSON/text) stay
+  in ASCII / English identifiers.
+- Only summarize articles that came from a real fetched page or, on
+  fetch failure, the email's own blurb. Do not invent content from model
+  memory.
+- Keep each article to a few short bullets — the user reads this to get
+  the overview fast.
+
+## Error handling
+
+- `gws` auth error: stop and tell the user to run `gws auth login`
+  themselves (this skill must not trigger an interactive login).
+- No unread TLDR: reply `未読の TLDR はありません。` and stop.
+- Body decode failure for one message: skip that message, note it in the
+  output, and continue with the rest.
+- `WebFetch` failure for one article: fall back to the email blurb and
+  flag it; do not abort the whole digest.
+- Many unread messages: irrelevant — the skill always processes only the
+  single oldest message, so never prompt for a count.
+
+## Out of scope
+
+- Posting the digest to external channels (Slack, push, email). The
+  digest is rendered in the chat response only.
+- Newsletters other than TLDR. The sender query and parsing rules are
+  TLDR-specific.
+- Persisting a dedup history. "Unread" is the dedup marker; optionally
+  mark mail read (Step 7) to avoid re-processing next time.
+
+## Security note
+
+The repository convention (`CLAUDE.md`) says any command that reaches
+the network, touches credentials, or shells out to a third-party CLI
+should run inside a hardened Docker container. This skill runs `gws`
+directly on the host instead, by an explicit decision of the repository
+owner. The reason: `gws` uses an OAuth flow and writes a refreshed
+access token back to `~/.config/gws/token_cache.json` on most calls, so
+the read-only credential-mount pattern used by the Docker-backed skills
+(`spotify-sheets`, `pdf2zh`) does not apply cleanly. `gws` is Google's
+official CLI and is only used here to read the user's own Gmail and,
+optionally, to remove the `UNREAD` label.
