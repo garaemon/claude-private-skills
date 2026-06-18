@@ -8,12 +8,13 @@ description: |
   the user's `ML/TLDR` Gmail label. For each genuine article — not a
   `(SPONSOR)` slot, a nav link, or a job posting — resolve its source
   URL from the email's footnote link list, fetch the page, and produce
-  a short Japanese outline summary. Gmail is read through the `gws`
-  (Google Workspace) CLI running directly on the host.
+  a short Japanese outline summary. Gmail is read through the
+  `gws-secure` wrapper (token-less, 1Password-backed) and the finished
+  digest is posted to Slack via the `slack-post` skill.
   Trigger when the user asks to read or summarize their TLDR / ML
   newsletters, with phrases like "TLDRまとめて", "TLDRの要約",
   "今日のTLDR", "ML/TLDR まとめ", "未読のTLDR読んで", "tldr-digest".
-allowed-tools: Bash(gws gmail:*), Bash(jq:*), Bash(base64:*), Bash(tr:*), Bash(date:*), Bash(mkdir:*), WebFetch
+allowed-tools: Bash(gws-secure gmail:*), Bash(jq:*), Bash(base64:*), Bash(tr:*), Bash(date:*), Bash(mkdir:*), Bash(mktemp:*), Bash(rm:*), Bash($CLAUDE_PLUGIN_ROOT/skills/slack-post/run.sh:*), WebFetch
 ---
 
 # TLDR Digest Skill
@@ -25,16 +26,23 @@ single oldest unread message — keeping only the genuine articles
 article's real source URL from the footnote link list at the bottom of
 the email, fetches that page, and summarizes it with a fixed prompt.
 
-The skill reads Gmail through the `gws` CLI. By an explicit decision of
-the repository owner this skill runs `gws` directly on the host rather
-than inside Docker — see [Security note](#security-note).
+The skill reads Gmail through the `gws-secure` wrapper, which mints a
+short-lived access token from 1Password on each call and never writes an
+OAuth token to disk — see [Security note](#security-note). After
+rendering the digest it posts it to Slack via the `slack-post` skill.
 
 ## Prerequisites
 
-- `gws` (Google Workspace CLI) is installed and already authenticated
-  (`gws gmail users messages list ...` succeeds without prompting). If a
-  call fails with an auth error, stop and tell the user to run
-  `gws auth login` themselves.
+- `gws-secure` is on `PATH` and bootstrapped: the OAuth client and a
+  refresh token live in the 1Password `googleworkspace cli` item (run
+  `scripts/gws-secure-bootstrap` once). A `gws-secure gmail ...` call must
+  succeed without prompting. If a call fails with an auth error, stop and
+  tell the user to re-run `scripts/gws-secure-bootstrap` themselves (this
+  skill must not trigger an interactive login). See
+  [`scripts/README.md`](../../../scripts/README.md).
+- The `slack-post` skill is set up: its Docker image is built and
+  `~/.config/slack-post/config.json` holds the bot token and a
+  `default_channel`. See the [slack-post skill](../slack-post/SKILL.md).
 - Network access for `WebFetch` to load article pages.
 - `jq` and `base64` are available (both ship with the host).
 - A writable cache directory for the raw message JSON. By default
@@ -50,7 +58,7 @@ That label is sometimes empty (the Gmail filter does not always apply),
 so query by sender, which is robust:
 
 ```bash
-gws gmail users messages list \
+gws-secure gmail users messages list \
   --params '{"userId":"me","q":"from:tldrnewsletter.com is:unread","maxResults":50}' \
   --format json
 ```
@@ -76,7 +84,7 @@ Gmail returns ids newest-first, so the oldest is the last id of the last
 page. Pick it like this:
 
 ```bash
-gws gmail users messages list \
+gws-secure gmail users messages list \
   --params '{"userId":"me","q":"label:ML/TLDR is:unread","maxResults":50}' \
   --format json | jq -r '.messages[-1].id'
 ```
@@ -98,7 +106,7 @@ part. Keep the large JSON in a file — do not read it into the response.
 CACHE_DIR="${TLDR_DIGEST_CACHE_DIR:-$HOME/.cache/claude-private-skills/tldr-digest}"
 mkdir -p "$CACHE_DIR"
 
-gws gmail users messages get \
+gws-secure gmail users messages get \
   --params '{"userId":"me","id":"<ID>","format":"full"}' \
   --format json > "$CACHE_DIR/<ID>.json"
 
@@ -116,8 +124,9 @@ jq -r '.payload.headers[] | select(.name=="Subject" or .name=="From" or .name=="
   "$CACHE_DIR/<ID>.json"
 ```
 
-Use `format=full` (not `metadata`): the `gws` metadata mode does not
-pass the `metadataHeaders` array correctly and returns empty headers.
+Use `format=full` (not `metadata`): the `gws` metadata mode (which
+`gws-secure` wraps) does not pass the `metadataHeaders` array correctly
+and returns empty headers.
 
 If the plain-text part is missing, fall back to the `text/html` part
 (same decode), then strip tags before parsing. This is rare.
@@ -204,7 +213,34 @@ Rules:
 - Process only the single oldest newsletter and label it with its subject
   and date.
 
-### Step 7 (optional): Mark as read and archive
+### Step 7: Post the digest to Slack
+
+Post the same rendered digest to Slack via the `slack-post` skill. Write
+the markdown body to a temp file and pass it with `--markdown` (the file
+path is bind-mounted read-only into the slack-post container, which avoids
+quoting a multi-line body into a CLI argument):
+
+```bash
+DIGEST_FILE="$(mktemp /tmp/tldr-digest.XXXXXX.md)"
+# Write the exact markdown rendered in Step 6 into "$DIGEST_FILE".
+"$CLAUDE_PLUGIN_ROOT/skills/slack-post/run.sh" post \
+  --text-file "$DIGEST_FILE" --markdown
+rm -f "$DIGEST_FILE"
+```
+
+Notes:
+
+- Posts to the `default_channel` configured in
+  `~/.config/slack-post/config.json`. The user can override the target by
+  setting `default_channel`, or you may add `--channel <id-or-name>` when
+  the user names a channel.
+- If `run.sh` fails because the image is missing, surface the build hint
+  it prints and stop — do not attempt to build the image.
+- If the Slack post fails for another reason, still show the digest in the
+  chat response and report the failure in one Japanese line; do not retry
+  in a loop.
+
+### Step 8 (optional): Mark as read and archive
 
 Marking mail read and archiving changes the user's Gmail state, so do it
 only when the user asks, and confirm first. "Mark as read" here always
@@ -213,7 +249,7 @@ remove both the `UNREAD` and `INBOX` labels. When confirmed, per processed
 id:
 
 ```bash
-gws gmail users messages modify \
+gws-secure gmail users messages modify \
   --params '{"userId":"me","id":"<ID>"}' \
   --json '{"removeLabelIds":["UNREAD","INBOX"]}'
 ```
@@ -233,8 +269,11 @@ Default behaviour is to leave the mail unread and in the inbox.
 
 ## Error handling
 
-- `gws` auth error: stop and tell the user to run `gws auth login`
-  themselves (this skill must not trigger an interactive login).
+- `gws-secure` auth error: stop and tell the user to re-run
+  `scripts/gws-secure-bootstrap` themselves (this skill must not trigger
+  an interactive login).
+- Slack post failure: keep the chat digest, report the failure in one
+  Japanese line, and do not retry in a loop (see Step 7).
 - No unread TLDR: reply `未読の TLDR はありません。` and stop.
 - Body decode failure for one message: skip that message, note it in the
   output, and continue with the rest.
@@ -245,22 +284,24 @@ Default behaviour is to leave the mail unread and in the inbox.
 
 ## Out of scope
 
-- Posting the digest to external channels (Slack, push, email). The
-  digest is rendered in the chat response only.
+- Channels other than Slack (push, email). The digest is rendered in the
+  chat response and posted to Slack (Step 7) only.
 - Newsletters other than TLDR. The sender query and parsing rules are
   TLDR-specific.
 - Persisting a dedup history. "Unread" is the dedup marker; optionally
-  mark mail read (Step 7) to avoid re-processing next time.
+  mark mail read (Step 8) to avoid re-processing next time.
 
 ## Security note
 
-The repository convention (`CLAUDE.md`) says any command that reaches
-the network, touches credentials, or shells out to a third-party CLI
-should run inside a hardened Docker container. This skill runs `gws`
-directly on the host instead, by an explicit decision of the repository
-owner. The reason: `gws` uses an OAuth flow and writes a refreshed
-access token back to `~/.config/gws/token_cache.json` on most calls, so
-the read-only credential-mount pattern used by the Docker-backed skills
-(`spotify-sheets`, `pdf2zh`) does not apply cleanly. `gws` is Google's
-official CLI and is only used here to read the user's own Gmail and,
-optionally, to remove the `UNREAD` label.
+Gmail is read through `gws-secure` (see
+[`scripts/README.md`](../../../scripts/README.md)), which runs Google's
+official `gws` CLI on the host but keeps the OAuth client and refresh
+token in 1Password and mints a short-lived access token in memory on each
+call. No OAuth token is written to disk — `gws` persists only the
+non-secret API discovery schema cache. `gws-secure` is used here only to
+read the user's own Gmail and, optionally, to remove the `UNREAD` label.
+
+The Slack post (Step 7) runs through the `slack-post` skill, which
+executes inside a hardened Docker container with the bot token mounted
+read-only — the standard isolation pattern for this repository's
+credential-touching, network-reaching skills.
