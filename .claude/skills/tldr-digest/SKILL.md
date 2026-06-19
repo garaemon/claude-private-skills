@@ -21,10 +21,11 @@ allowed-tools: Bash(gws-secure gmail:*), Bash(jq:*), Bash(base64:*), Bash(tr:*),
 
 Turn the user's oldest unread TLDR newsletter email into a concise
 Japanese digest. The skill always processes exactly one newsletter — the
-single oldest unread message — keeping only the genuine articles
-(dropping sponsor slots, navigation, and job ads), resolves each
-article's real source URL from the footnote link list at the bottom of
-the email, fetches that page, and summarizes it with a fixed prompt.
+single oldest unread message that is still in the inbox (archived mail is
+excluded) — keeping only the genuine articles (dropping sponsor slots,
+navigation, and job ads), resolves each article's real source URL from the
+footnote link list at the bottom of the email, fetches that page, and
+summarizes it with a fixed prompt.
 
 The skill reads Gmail through the `gws-secure` wrapper, which mints a
 short-lived access token from 1Password on each call and never writes an
@@ -51,51 +52,56 @@ rendering the digest it posts it to Slack via the `slack-post` skill.
 
 ## Workflow
 
-### Step 1: Find unread TLDR messages
+### Step 1: Find unread TLDR messages in the inbox
 
-The user's intent is "unread TLDR emails under the `ML/TLDR` label".
-That label is sometimes empty (the Gmail filter does not always apply),
-so query by sender, which is robust:
+The user's intent is "unread TLDR emails still in the inbox under the
+`ML/TLDR` label". Archived mail (messages without the `INBOX` label) must
+be excluded, so every query includes `in:inbox`. That label is sometimes
+empty (the Gmail filter does not always apply), so query by sender, which
+is robust:
 
 ```bash
 gws-secure gmail users messages list \
-  --params '{"userId":"me","q":"from:tldrnewsletter.com is:unread","maxResults":50}' \
+  --params '{"userId":"me","q":"from:tldrnewsletter.com is:unread in:inbox","maxResults":50}' \
   --format json
 ```
 
 Notes:
 
 - Prefer the label when it is populated. You may first try
-  `"q":"label:ML/TLDR is:unread"`; if it returns zero results, fall
-  back to the sender query above. Do not fail just because the label is
-  empty.
+  `"q":"label:ML/TLDR is:unread in:inbox"`; if it returns zero results,
+  fall back to the sender query above. Do not fail just because the label
+  is empty.
+- `in:inbox` is required: an unread message that has been archived is no
+  longer in the inbox and must not be picked. Never drop `in:inbox` to
+  "find more" messages.
 - The response lists message ids only. `resultSizeEstimate` is an
   estimate of the total match count, not the page size.
-- If there are no unread messages, stop and reply with a single
-  Japanese line: `未読の TLDR はありません。`
+- If there are no unread messages in the inbox, stop and reply with a
+  single Japanese line: `未読の TLDR はありません。`
 
-### Step 2: Select the single oldest unread message
+### Step 2: Select the single oldest unread inbox message
 
 This skill always processes exactly **one** newsletter: the oldest unread
-TLDR. Never ask the user how many to process and never batch — regardless
-of how many unread messages exist.
+TLDR still in the inbox. Never ask the user how many to process and never
+batch — regardless of how many unread messages exist.
 
 Gmail returns ids newest-first, so the oldest is the last id of the last
 page. Pick it like this:
 
 ```bash
 gws-secure gmail users messages list \
-  --params '{"userId":"me","q":"label:ML/TLDR is:unread","maxResults":50}' \
+  --params '{"userId":"me","q":"label:ML/TLDR is:unread in:inbox","maxResults":50}' \
   --format json | jq -r '.messages[-1].id'
 ```
 
-- If the response contains a `nextPageToken`, there are more unread
+- If the response contains a `nextPageToken`, there are more matching
   messages than one page holds and the true oldest is on a later page.
   Follow the token (pass it as `"pageToken"` in `--params`) until no token
   remains, then take the last id of the final page.
-- Report the total unread count to the user in one Japanese line for
-  context (e.g. `未読 TLDR は N 通。一番古い 1 通を処理します。`), then
-  continue with that single id through Steps 3–6.
+- Report the total unread-in-inbox count to the user in one Japanese line
+  for context (e.g. `受信トレイの未読 TLDR は N 通。一番古い 1 通を処理します。`),
+  then continue with that single id through Steps 3–6.
 
 ### Step 3: Fetch each message and decode its body
 
@@ -274,7 +280,7 @@ Default behaviour is to leave the mail unread and in the inbox.
   an interactive login).
 - Slack post failure: keep the chat digest, report the failure in one
   Japanese line, and do not retry in a loop (see Step 7).
-- No unread TLDR: reply `未読の TLDR はありません。` and stop.
+- No unread TLDR in the inbox: reply `未読の TLDR はありません。` and stop.
 - Body decode failure for one message: skip that message, note it in the
   output, and continue with the rest.
 - `WebFetch` failure for one article: fall back to the email blurb and
@@ -288,8 +294,9 @@ Default behaviour is to leave the mail unread and in the inbox.
   chat response and posted to Slack (Step 7) only.
 - Newsletters other than TLDR. The sender query and parsing rules are
   TLDR-specific.
-- Persisting a dedup history. "Unread" is the dedup marker; optionally
-  mark mail read (Step 8) to avoid re-processing next time.
+- Persisting a dedup history. "Unread and still in the inbox" is the dedup
+  marker; mark mail read and archive it (Step 8) so it drops out of the
+  candidate set and is not re-processed next time.
 
 ## Security note
 
