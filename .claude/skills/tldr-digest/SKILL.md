@@ -1,6 +1,5 @@
 ---
 name: tldr-digest
-model: haiku
 description: |
   Summarize the real articles in unread TLDR newsletter emails in
   Japanese. TLDR newsletters (TLDR AI, TLDR Web Dev, the main TLDR,
