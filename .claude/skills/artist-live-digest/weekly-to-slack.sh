@@ -4,7 +4,9 @@
 #
 # A single `claude -p` invocation chains spotify-sheets, web search, and
 # slack-post in one model session. Skip the Slack post entirely when the
-# digest reports no new events.
+# digest reports no new events. The invocation goes through the shared
+# claude-with-retry.sh wrapper so a usage-limit window is waited out and retried
+# rather than losing the weekly digest.
 
 set -euo pipefail
 
@@ -16,6 +18,15 @@ if [[ ! -x "$CLAUDE_BIN" ]]; then
   echo "error: claude CLI not found or not executable at $CLAUDE_BIN" >&2
   exit 1
 fi
+
+# Wrapper that retries `claude -p` when the Anthropic usage limit is hit. It
+# reads the claude binary from CLAUDE_BIN, so export it for the subprocess.
+RETRY_SH="${PROJECT_DIR}/scripts/claude-with-retry.sh"
+if [[ ! -x "$RETRY_SH" ]]; then
+  echo "error: retry wrapper not found or not executable at $RETRY_SH" >&2
+  exit 1
+fi
+export CLAUDE_BIN
 
 cd "$PROJECT_DIR"
 
@@ -61,4 +72,4 @@ prompt+="Japanese digest body to Slack via the slack-post skill with the "
 prompt+="--markdown flag. If there are zero new events, do not post anything "
 prompt+="to Slack and exit."
 
-exec "$CLAUDE_BIN" -p "$prompt" --allowedTools "${allowed_tools[@]}"
+exec "$RETRY_SH" -p "$prompt" --allowedTools "${allowed_tools[@]}"
