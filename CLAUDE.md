@@ -24,7 +24,9 @@ npx --yes markdownlint-cli2 "**/*.md" "!REVIEW.md" "!**/templates/**"
 
 Configuration lives in `.markdownlint.json`. It keeps the default rule set
 but disables `MD013` (line length), `MD033` (inline HTML), and `MD041`
-(first-line heading) so docs with YAML frontmatter pass cleanly.
+(first-line heading) so docs with YAML frontmatter pass cleanly, and scopes
+`MD024` (duplicate headings) to `siblings_only` so independent sections may
+reuse generic headings like `Usage` or `Tests` under different parents.
 
 ### README skills-link check
 

@@ -38,7 +38,9 @@ jobs:
           scripts=(
             .claude/skills/**/*.sh
             scripts/gws-secure
+            scripts/claude-with-retry.sh
             scripts/tests/gws-secure-smoke.sh
+            scripts/tests/claude-with-retry-smoke.sh
           )
           if [ ${#scripts[@]} -eq 0 ]; then
             echo "No shell scripts to check."
@@ -53,6 +55,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run smoke test
         run: bash scripts/tests/gws-secure-smoke.sh
+
+  claude-with-retry-smoke:
+    name: claude-with-retry smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke test
+        run: bash scripts/tests/claude-with-retry-smoke.sh
 
   spotify-sheets-image:
     name: Build spotify-sheets image

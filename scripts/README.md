@@ -1,5 +1,53 @@
 # Repository scripts
 
+## `claude-with-retry.sh` — retry `claude -p` past a usage-limit window
+
+`claude-with-retry.sh` wraps a `claude -p` invocation so an unattended job
+survives hitting the Anthropic usage limit instead of silently producing
+nothing.
+
+In print mode, Claude Code emits a line of the form
+
+```text
+Claude AI usage limit reached|<unix-epoch-seconds>
+```
+
+when the account's usage/rate limit is exhausted; the trailing epoch is when the
+limit resets. The wrapper detects that line (regardless of exit status — Claude
+Code sometimes reports the limit as a normal result message), sleeps until the
+reset time plus a small buffer, and re-runs the exact same command. Any other
+outcome is passed straight through: a clean run exits 0, and a non-limit failure
+propagates its original exit code without retrying.
+
+The `spotify-daily-digest`, `news-digest`, and `artist-live-digest` systemd
+`--user` timer wrappers route their `claude -p` calls through this script, so a
+morning/weekly digest that lands inside a usage-limit window is waited out and
+retried rather than lost.
+
+### Usage
+
+```bash
+CLAUDE_BIN=/path/to/claude scripts/claude-with-retry.sh -p "prompt" --allowedTools ...
+```
+
+### Configuration
+
+All optional, via environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CLAUDE_BIN` | `~/.local/bin/claude` | path to the `claude` CLI |
+| `CLAUDE_RETRY_MAX_ATTEMPTS` | `3` | total attempts before giving up |
+| `CLAUDE_RETRY_BUFFER_SEC` | `60` | extra seconds to wait past the reset time |
+| `CLAUDE_RETRY_MAX_SLEEP_SEC` | `21600` | cap on a single wait (6h) |
+| `CLAUDE_RETRY_DEFAULT_SLEEP_SEC` | `900` | wait used when the reset epoch is already past or unparseable |
+
+### Tests
+
+`scripts/tests/claude-with-retry-smoke.sh` drives the wrapper against a fake
+`claude` stub (no CLI, network, or account needed) covering the clean run,
+non-limit failure pass-through, retry-then-succeed, and limit-persists paths.
+
 ## `gws-secure` — token-less Google Workspace CLI
 
 `gws-secure` wraps the [`gws`](https://www.npmjs.com/package/@googleworkspace/cli)
