@@ -1,9 +1,10 @@
 ---
 name: branch-review
 description: |
-  Review code changes on the current branch against the default branch (auto-detected;
-  supports main, master, etc.), producing a structured REVIEW.md and posting inline
-  review comments on specific file lines via GitHub API.
+  Review code changes on the current branch against the branch they merge into
+  (the pull request's base branch when one is open, so stacked PRs review only their
+  own changes; the repository default branch otherwise), producing a structured
+  REVIEW.md and posting inline review comments on specific file lines via GitHub API.
   Use this skill whenever the user wants a code review, says things like "review",
   "code review", "/branch-review", "レビューして", "コードレビュー", "PRレビュー",
   "変更をチェックして", or asks to check code quality before merging. Also trigger
@@ -12,8 +13,9 @@ description: |
 
 # Code Review Skill
 
-Perform a systematic code review of the current branch's changes against main.
-This skill is language-agnostic and works with any programming language.
+Perform a systematic code review of the current branch's changes against the
+branch they merge into. This skill is language-agnostic and works with any
+programming language.
 
 ## Review Philosophy
 
@@ -45,57 +47,137 @@ case is handled or every abstraction is finalized. Instead, check that:
 Flag missing TODOs (incomplete code without any marker) but do not flag
 the presence of TODOs as a problem.
 
+## Scripts
+
+All git and GitHub access goes through these scripts, in `scripts/` next to this
+file. `<skill_dir>` below is the skill's base directory, given to you when the
+skill is invoked.
+
+| Script | Use it for |
+| --- | --- |
+| `gather_diff.py` | Resolving the review range and printing the diff (Steps 0-1.5) |
+| `list_commentable_lines.py` | Finding which lines can take an inline comment (Step 5) |
+| `post_review.py` | Validating and posting the review (Step 5) |
+| `commands.py` | Shared git/`gh` runners; not run directly |
+
+**Do not run `git` or `gh` directly.** Base resolution, GitHub host selection and
+comment anchoring are all easy to get subtly wrong -- reviewing against the wrong
+base wastes the whole review, talking to the wrong host reports that the pull
+request does not exist, and one bad anchor makes GitHub reject every comment at
+once. The scripts encode those rules and check them. If a script cannot do what
+you need, say so rather than reaching for a raw command.
+
+### Running them
+
+**Always run the scripts with `uv run --project <skill_dir>`**, never with a bare
+`python3`:
+
+```bash
+uv run --project <skill_dir> <skill_dir>/scripts/gather_diff.py
+```
+
+`--project` is required, not decorative. Without it `uv` searches upward from the
+current directory for a `pyproject.toml` and would attach to **the repository
+being reviewed**, picking up that project's Python version and dependencies.
+Pointing it at the skill directory pins the interpreter to the one in
+`uv.lock` regardless of which repository the review runs in. The working
+directory still has to be inside the checkout under review -- `--project`
+changes dependency resolution, not `cwd`.
+
+The scripts are standard library only, so `uv` resolves them without a network
+fetch after the first run.
+
+Every script takes `--help`. Their unit tests run with:
+
+```bash
+uv run --project <skill_dir> -m unittest discover \
+  -s <skill_dir>/scripts -t <skill_dir>/scripts
+```
+
+### GitHub Enterprise
+
+The scripts derive `GH_HOST` from the `origin` remote and pass it to every `gh`
+call, so a GitHub Enterprise checkout works with no setup. Both remote URL forms
+are understood: `git@github.example.com:owner/repo.git` and
+`https://github.example.com/owner/repo.git`.
+
+An inherited `GH_HOST` is deliberately overridden -- the repository under review
+decides which server to talk to, not the ambient environment. `gather_diff.py`
+prints the host it resolved as `github_host:` in its `review range` block; if that
+line names the wrong server, stop and tell the user rather than posting anything.
+
 ## Workflow
 
-### Step 0: Detect the default branch and fetch
+### Step 0-1: Gather the diff
 
-Detect the repository's default branch -- it may be `main`, `master`, or something
-else. Use the following command:
-
-```bash
-git remote show origin | sed -n 's/  HEAD branch: //p'
-```
-
-If this fails (e.g., no remote configured), fall back to checking which of `main` or
-`master` exists locally:
+Run the script. It resolves the range, fetches what it needs, and prints the
+range, the diff size, the changed files, the per-file stat, and the commits in
+one pass:
 
 ```bash
-git branch --list main master | head -1 | tr -d ' '
+uv run --project <skill_dir> <skill_dir>/scripts/gather_diff.py
 ```
 
-Store the result as `DEFAULT_BRANCH` and use it in all subsequent commands instead of
-hardcoding `main`.
+Read its `review range` block and confirm the scope is what the user asked for
+before going further.
 
-Then fetch the latest state of the default branch from origin so the diff is up to date:
+#### Scoping the review
+
+By default the whole branch is reviewed. **If the user asked for a narrower
+scope, pass the matching flag** -- do not review the whole branch and filter the
+findings by hand, because the size check, the file list and the commit list
+would all still describe the wrong span.
+
+| The user says | Flag |
+| --- | --- |
+| "直近のcommitだけ", "just the last commit" | `--last 1` |
+| "最後の3コミット", "the last 3 commits" | `--last 3` |
+| "このコミットだけ", "review commit abc123" | `--commit abc123` |
+| "abc123からdef456まで", an explicit range | `--range abc123..def456` |
+| "developブランチとの差分" | `--base develop` |
+| nothing about scope | (no flag: whole branch) |
 
 ```bash
-git fetch origin $DEFAULT_BRANCH
+uv run --project <skill_dir> <skill_dir>/scripts/gather_diff.py --last 1
+uv run --project <skill_dir> <skill_dir>/scripts/gather_diff.py --commit abc123
+uv run --project <skill_dir> <skill_dir>/scripts/gather_diff.py --range abc123..def456
 ```
 
-Use the merge-base (common ancestor) of `origin/$DEFAULT_BRANCH` and `HEAD` as the
-diff base. This ensures the review covers only the changes introduced on the current
-branch, not unrelated commits that landed on the default branch after branching.
+`--commit` reviews that commit's own change (`REV^..REV`), and works on a root
+commit. `--range` also accepts git's three-dot form (`main...HEAD`, meaning
+"since the two diverged") and a bare revision (`abc123`, meaning `abc123..HEAD`).
 
-Compute the merge-base once and reuse it:
+#### How the default base is chosen
 
-```bash
-MERGE_BASE=$(git merge-base origin/$DEFAULT_BRANCH HEAD)
-```
+With no scope flag, the base is **the branch these changes will actually merge
+into**, which is not always the repository default:
 
-### Step 1: Gather the diff
+| Situation | Base used |
+| --- | --- |
+| Pull request open for this branch | that PR's base branch |
+| No pull request yet | repository default branch |
+| Neither resolves | local `main` / `master` |
 
-```bash
-git diff --stat $MERGE_BASE..HEAD
-git diff --name-status $MERGE_BASE..HEAD
-git log --oneline $MERGE_BASE..HEAD
-```
+This matters most for **stacked pull requests**, where the PR targets the branch
+below it rather than `main`. Diffing against `main` there pulls in every change
+from the PRs underneath and makes you review work that was already reviewed. If
+the resolved base looks wrong, override it with `--base`.
 
-Identify all added and modified files. Ignore deleted files entirely.
+The default range is measured from the merge-base, so commits that landed on the
+base after this branch was cut are excluded. The explicit flags (`--last`,
+`--commit`, `--range`) name their endpoints outright and take no merge-base.
+
+Review the files listed under `files to review`. The script lists deleted files
+separately -- ignore those entirely.
+
+To see the actual hunks rather than the whole file, add `--patch` for the full
+diff or `--patch-for <path>` for one file. Prefer this over reading a file with
+the Read tool when you need to tell changed code from pre-existing code.
 
 ### Step 1.5: Check PR size
 
-If the diff has more than 200 lines of additions, flag this in Overall Comments
-and suggest splitting into smaller PRs. (Use `$MERGE_BASE` as the base.)
+`gather_diff.py` prints a `NOTE` when additions exceed 200. When it does, flag
+PR size in Overall Comments and suggest splitting into smaller PRs.
 
 When suggesting a split, propose concrete PR boundaries based on the actual
 changes. Good split criteria:
@@ -293,13 +375,8 @@ leave it out entirely instead of marking it "Low".
 
 ### Step 5: PR integration
 
-After writing REVIEW.md, check if a PR exists:
-
-```bash
-gh pr view --json number,url 2>/dev/null
-```
-
-If a PR exists, ask the user:
+`gather_diff.py` already reported whether a pull request exists, in the
+`pull_request` field of its `review range` block. If one exists, ask the user:
 
 > REVIEW.md を作成しました。このブランチにPR (#N) があります。PRにインラインレビューコメントを投稿しますか?
 
@@ -308,64 +385,85 @@ using the GitHub Pull Request Review API. Do NOT post without confirmation.
 
 #### How to post inline review comments
 
-Build a JSON payload and submit it via `gh api`. Each finding becomes an inline
-comment attached to the exact file and line it references.
+Write the findings to a JSON file, then let the script validate and post it.
+Write the file to the scratchpad directory, not the user's project.
 
-```bash
-gh api -X POST repos/{owner}/{repo}/pulls/{number}/reviews \
-  --input /dev/stdin <<'JSON'
+```json
 {
-  "body": "Overall summary of the review (cross-cutting concerns, PR size notes, etc.)",
+  "body": "Overall summary: cross-cutting concerns, PR size notes, findings that anchor to no single line.",
   "event": "COMMENT",
   "comments": [
     {
-      "path": "relative/path/to/file.ts",
+      "path": "src/main/index.ts",
       "line": 29,
-      "side": "RIGHT",
       "body": "### 2-1. IPC color inputs not validated\n\nThe `UPDATE_COLOR` handler accepts arbitrary strings...\n\nSuggestion: validate against `/^#[0-9A-Fa-f]{6}$/`."
-    },
-    {
-      "path": "relative/path/to/other.ts",
-      "line": 86,
-      "side": "RIGHT",
-      "body": "### 5-1. Async callback in 'closed' event\n\n..."
     }
   ]
 }
-JSON
 ```
 
-Rules for building the payload:
-
-- **`path`**: relative to the repo root (e.g., `stickies-md-electron/src/main/index.ts`),
-  NOT an absolute filesystem path.
-- **`line`**: the line number in the file on the HEAD side of the diff (the new version).
-  This must be a line that actually appears in the diff. If the finding refers to a line
-  that is not part of the diff (unchanged context), attach it to the nearest changed line
-  in the same file, or fall back to a general review comment in `body`.
-- **`side`**: always `"RIGHT"` (we comment on the new code, not the removed code).
-- **`body`**: use the same heading format as REVIEW.md (`### N-N. Short description`),
-  followed by explanation. Use markdown. Keep each comment self-contained -- reviewers
-  may read them individually.
-- **`event`**: use `"COMMENT"` (neutral). Do NOT use `"REQUEST_CHANGES"` or `"APPROVE"`
-  unless the user explicitly asks.
-- Put cross-cutting concerns (PR size, overall architecture notes) in the top-level
-  `"body"` field, not as inline comments.
-- If a finding cannot be mapped to a specific diff line (e.g., a missing file, a
-  cross-file concern), include it only in the top-level `"body"`.
-
-To find the correct line numbers in the diff, run:
+Validate first, then post once it is clean:
 
 ```bash
-gh api repos/{owner}/{repo}/pulls/{number}/files --jq '.[].patch' | head -100
+uv run --project <skill_dir> <skill_dir>/scripts/post_review.py findings.json --dry-run
+uv run --project <skill_dir> <skill_dir>/scripts/post_review.py findings.json
 ```
 
-Or use the line numbers you already collected during Step 2/3 reading. Verify the
-line exists in the diff by checking `git diff $MERGE_BASE..HEAD -- <file>`.
+The script fills in `"side": "RIGHT"` and defaults `"event"` to `"COMMENT"`, so
+neither belongs in the file. It checks every anchor against the pull request
+diff before sending anything, and refuses to post if any is bad -- **GitHub
+rejects the entire review when a single comment anchors outside the diff**, so
+one wrong line number would otherwise lose every finding. On failure it names
+the offending anchor and the nearest usable line:
+
+```text
+error: refusing to post; GitHub rejects the whole review on a bad anchor
+  Makefile:999 - not in the diff; nearest anchorable line is 68
+  no/such/file.go:1 - file is not in the pull request diff
+```
+
+To pick anchors while you are still writing findings, ask which lines are
+available:
+
+```bash
+uv run --project <skill_dir> <skill_dir>/scripts/list_commentable_lines.py
+uv run --project <skill_dir> <skill_dir>/scripts/list_commentable_lines.py --path src/main/index.ts
+```
+
+Anchorable lines always come from **the pull request's own diff**, whatever range
+you reviewed. That is normally a superset of a narrower range, so a `--last 1`
+review anchors fine. It is not a superset in one case: a line that an
+intermediate commit touched and a later commit changed back or removed does not
+survive into the PR's net diff. `post_review.py` catches those and names them --
+move such a finding to the top-level `body` rather than forcing an anchor.
+
+Rules for building the findings file:
+
+- **`path`**: relative to the repo root, NOT an absolute filesystem path.
+- **`line`**: a line on the HEAD side of the diff. Added *and* context lines
+  inside a hunk are both anchorable. If a finding refers to a line outside the
+  diff, move it to the nearest changed line in the same file, or to `body`.
+- **`body`**: use the same heading format as REVIEW.md (`### N-N. Short
+  description`), followed by the explanation. Keep each comment self-contained
+  -- reviewers may read them individually, so repeat the context a reader needs
+  rather than referring to "the finding above".
+- **`event`**: leave it out. Only set `"APPROVE"` or `"REQUEST_CHANGES"` when
+  the user explicitly asks for one.
+- Put cross-cutting concerns (PR size, overall architecture notes) and any
+  finding that maps to no single line in the top-level `"body"`.
 
 ## Important Rules
 
 - Always respond in Japanese.
+- Use the scripts in `scripts/` for all git and GitHub access. Do not run `git`
+  or `gh` directly.
+- Invoke every script with `uv run --project <skill_dir>`, never a bare `python3`.
+- Honour a requested scope. If the user asked for "just the last commit" or a
+  specific range, pass `--last` / `--commit` / `--range` to `gather_diff.py`
+  rather than reviewing the whole branch and filtering afterwards. Say which
+  range you reviewed when reporting back.
+- Review against the base the branch actually merges into, which for a stacked
+  pull request is the PR's base branch, not the repository default.
 - Read ALL changed files before writing any findings. No exceptions.
 - Do not review deleted files.
 - Focus on the diff, not pre-existing code that was not changed in this branch.
